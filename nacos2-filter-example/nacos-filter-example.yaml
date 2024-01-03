@@ -1,0 +1,87 @@
+admin:
+  access_log_path: /dev/null
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 0
+
+static_resources:
+  clusters:
+    name: nacos
+    connect_timeout: 0.25s
+    load_assignment:
+      cluster_name: nacos
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 8848
+    name: nacos_2
+    connect_timeout: 0.25s
+    http2_protocol_options: {}
+    load_assignment:
+      cluster_name: nacos_2
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 9848
+
+  listeners:
+    name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 18848
+    filter_chains:
+    - filters:
+      - name: envoy.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/nacos" }
+                route: { cluster: nacos }
+          http_filters:
+          - name: sample          # before envoy.router because order matters!
+            config:
+              key: via
+              val: sample-filter
+          - name: envoy.router
+    name: listener_nacos2
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 19848
+    filter_chains:
+    - filters:
+      - name: envoy.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains:
+              - "*"
+              routes:
+              - match:
+                  prefix: "/"
+                  grpc: {}
+                route:
+                  cluster: nacos_2
+          http_filters:
+          - name: nacos2_example          # before envoy.router because order matters!             
+          - name: envoy.router
