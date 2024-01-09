@@ -6,9 +6,7 @@
 #include "common/grpc/status.h"
 #include "common/http/headers.h"
 #include "common/http/utility.h"
-
-#include "nacos2-filter-example/nacos_grpc_service.pb.h"
-
+#include "common/json/json_loader.h"
 #include "extensions/filters/http/well_known_names.h"
 
 namespace Envoy {
@@ -49,7 +47,16 @@ void adjustContentLength(Http::HeaderMap& headers,
 }
 } // namespace
 
+Filter::Filter(Grpc::Context& context): context_(context) {
+  ENVOY_LOG(info, "construct nacos2 filter");
+}
+
+Filter::~Filter() {
+  ENVOY_LOG(info, "destroy nacos2 filter");
+}
+
 Http::FilterHeadersStatus Filter::decodeHeaders(Http::HeaderMap& headers, bool end_stream) {
+  ENVOY_LOG(info, "nacos2 request headers complete (end_stream={}): {} filter", end_stream, headers);
   // Short circuit if header only.
   if (end_stream) {
     return Http::FilterHeadersStatus::Continue;
@@ -63,11 +70,6 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::HeaderMap& headers, bool e
   if (Envoy::Grpc::Common::hasGrpcContentType(headers)) {
     enabled_ = true;
   }
-
-  // ENVOY_CONN_LOG(trace, "nacos2 request headers complete (end_stream={}):\n{}", context_. end_stream, headers);
-  // ENVOY_STREAM_LOG(debug, "nacos2 request headers complete (end_stream={}):\n{}", end_stream, headers);
-  ENVOY_LOG(info, "==> nacos2 request headers complete (end_stream={}):\n{}", end_stream, headers);
-
   return Http::FilterHeadersStatus::Continue;
 }
 
@@ -80,43 +82,174 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& buffer, bool end_str
                                          RcDetails::get().GrpcBridgeFailedTooSmall);
       return Http::FilterDataStatus::StopIterationNoBuffer;
     }
-      if (end_stream) {
-        onDecodeComplete(buffer);
-      }
+    // For requests, EOS (end-of-stream) is indicated by the presence of the END_STREAM flag on the last received DATA frame. 
+    // In scenarios where the Request stream needs to be closed but no data remains to be sent implementations MUST send an empty DATA frame with this flag set.
+    if (end_stream) {
+      ENVOY_LOG(info, "nacos2 request complete");
+      com::alibaba::nacos::api::grpc::Payload nacos_playload;
+      onDecodeComplete(buffer, &nacos_playload);
+    }
   }
   return Http::FilterDataStatus::Continue;
 }
 
-void Filter::onDecodeComplete(Buffer::Instance& data) {
-  ENVOY_LOG(info, "==> nacos2 request data complete length {} \n", data.length());
-  // 不能改这个 data，否则继续 continue 时会导致 upstream 解析这个 grpc 请求报错，nacos-server 会直接 reset
-  // data.drain(Grpc::GRPC_FRAME_HEADER_SIZE); 
-  std::string body =  data.toString().substr(5);
-  ENVOY_LOG(info, "==> nacos2 request data to string length {} \n", body.length());
-  com::alibaba::nacos::api::grpc::Payload nacos_playload;
-  if (nacos_playload.ParseFromString(body)) {
-    ENVOY_LOG(info, "==> nacos2 request data to palyload {} \n", nacos_playload.DebugString());
-  } else {
-    ENVOY_LOG(warn, "==> nacos2 request data to palyload fail\n");
-  }
+Http::FilterTrailersStatus Filter::decodeTrailers(Http::HeaderMap&) {
+    return Http::FilterTrailersStatus::Continue;
 }
 
+bool Filter::onDecodeComplete(Buffer::Instance& data, com::alibaba::nacos::api::grpc::Payload* playload) {
+  ENVOY_LOG(info, "nacos2  DATA frame complete length {} \n", data.length());
+  // 不能改这个 data，否则继续 continue 时会导致 upstream 解析这个 grpc 请求报错，nacos-server 会直接 reset 
+  std::string body =  data.toString().substr(Grpc::GRPC_FRAME_HEADER_SIZE);
+  ENVOY_LOG(info, "nacos2 playload length {} \n", body.length());
+  if (playload->ParseFromString(body)) {
+    ENVOY_LOG(info, "nacos2 palyload {} \n", playload->DebugString());
+    return true;
+  } else {
+    ENVOY_LOG(error, "nacos2 playload parse fail.");
+  }
+
+  return false;
+}
+// *********************************
 // for response
 
-Http::FilterHeadersStatus Filter::encodeHeaders(Http::HeaderMap& headers, bool) {
-  if (enabled_) {
+/*
+   The HEADERS frame defines the following flags:
+
+   END_STREAM (0x1):  When set, bit 0 indicates that the header block
+      (Section 4.3) is the last that the endpoint will send for the
+      identified stream.
+
+      A HEADERS frame carries the END_STREAM flag that signals the end
+      of a stream.  However, a HEADERS frame with the END_STREAM flag
+      set can be followed by CONTINUATION frames on the same stream.
+      Logically, the CONTINUATION frames are part of the HEADERS frame.
+
+   END_HEADERS (0x4):  When set, bit 2 indicates that this frame
+      contains an entire header block (Section 4.3) and is not followed
+      by any CONTINUATION frames.
+
+      A HEADERS frame without the END_HEADERS flag set MUST be followed
+      by a CONTINUATION frame for the same stream.  A receiver MUST
+      treat the receipt of any other type of frame or a frame on a
+      different stream as a connection error (Section 5.4.1) of type
+      PROTOCOL_ERROR.
+
+   PADDED (0x8):  When set, bit 3 indicates that the Pad Length field
+      and any padding that it describes are present.
+
+   PRIORITY (0x20):  When set, bit 5 indicates that the Exclusive Flag
+      (E), Stream Dependency, and Weight fields are present; see
+      Section 5.3.
+
+   The payload of a HEADERS frame contains a header block fragment
+   (Section 4.3).  A header block that does not fit within a HEADERS
+   frame is continued in a CONTINUATION frame (Section 6.10).
+
+   HEADERS frames MUST be associated with a stream.  If a HEADERS frame
+   is received whose stream identifier field is 0x0, the recipient MUST
+   respond with a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   The HEADERS frame changes the connection state as described in
+   Section 4.3.
+
+   The HEADERS frame can include padding.  Padding fields and flags are
+   identical to those defined for DATA frames (Section 6.1).  Padding
+   that exceeds the size remaining for the header block fragment MUST be
+   treated as a PROTOCOL_ERROR.
+
+   Prioritization information in a HEADERS frame is logically equivalent
+   to a separate PRIORITY frame, but inclusion in HEADERS avoids the
+   potential for churn in stream prioritization when new streams are
+   created.  Prioritization fields in HEADERS frames subsequent to the
+   first on a stream reprioritize the stream (Section 5.3.3).
+*/
+Http::FilterHeadersStatus Filter::encodeHeaders(Http::HeaderMap& headers, bool end_stream) {
+  ENVOY_LOG(info, "nacos2 response headers complete (end_stream={}): \n{}", end_stream, headers);
+  if (Envoy::Grpc::Common::hasGrpcContentType(headers)) {
+    enabled_ = true;
   }
+
   return Http::FilterHeadersStatus::Continue;
 }
 
-Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_stream) {
-  if (!enabled_) {
-    return Http::FilterDataStatus::Continue;
-  }
+/*
+The DATA frame defines the following flags:
+   END_STREAM (0x1):  When set, bit 0 indicates that this frame is the
+      last that the endpoint will send for the identified stream.
+      Setting this flag causes the stream to enter one of the "half-
+      closed" states or the "closed" state (Section 5.1).
 
-  if (end_stream) {
-    return Http::FilterDataStatus::Continue;
+   PADDED (0x8):  When set, bit 3 indicates that the Pad Length field
+      and any padding that it describes are present.
+
+   DATA frames MUST be associated with a stream.  If a DATA frame is
+   received whose stream identifier field is 0x0, the recipient MUST
+   respond with a connection error (Section 5.4.1) of type
+   PROTOCOL_ERROR.
+
+   DATA frames are subject to flow control and can only be sent when a
+   stream is in the "open" or "half-closed (remote)" state.  The entire
+   DATA frame payload is included in flow control, including the Pad
+   Length and Padding fields if present.  If a DATA frame is received
+   whose stream is not in "open" or "half-closed (local)" state, the
+   recipient MUST respond with a stream error (Section 5.4.2) of type
+   STREAM_CLOSED.
+
+   The total number of padding octets is determined by the value of the
+   Pad Length field.  If the length of the padding is the length of the
+   frame payload or greater, the recipient MUST treat this as a
+   connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+      Note: A frame can be increased in size by one octet by including a
+      Pad Length field with a value of zero.
+*/
+
+Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_stream) {
+  // 在 response 的 DATA frame 里面 end_stream 就没为空过
+  ENVOY_LOG(info, "nacos2 response end_stream: {} filter", end_stream);
+  if (enabled_) {
+    // Fail the request if the body is too small to possibly contain a gRPC frame.
+    if (buffer.length() < Grpc::GRPC_FRAME_HEADER_SIZE) {
+      decoder_callbacks_->sendLocalReply(Http::Code::OK, "invalid response body", nullptr,
+                                         Grpc::Status::GrpcStatus::Unknown,
+                                         RcDetails::get().GrpcBridgeFailedTooSmall);
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+    com::alibaba::nacos::api::grpc::Payload nacos_playload;
+    if (onDecodeComplete(buffer, &nacos_playload)) {
+      // 如果是服务发现相关的请求
+      ::com::alibaba::nacos::api::grpc::Metadata nacos_metadata = nacos_playload.metadata();
+      if ( nacos_metadata.type() == "SubscribeServiceResponse" || nacos_metadata.type() == "NotifySubscriberRequest") {
+        try {
+          Json::ObjectSharedPtr json_body = Json::Factory::loadFromString(nacos_playload.body().value());
+          Json::ObjectSharedPtr serviceinfo_json =  json_body->getObject("serviceInfo", false);
+          std::vector<Json::ObjectSharedPtr> hosts_json =  serviceinfo_json->getObjectArray("hosts", false);
+          for(const auto& host : hosts_json) {
+            ENVOY_LOG(info, "nacos2 return host ip {}", host->getString("ip"));
+          }
+        } catch (const Json::Exception& e) {
+          // Body parsing failed.
+          ENVOY_LOG(error, "nacos2 json body {} parse fail {}", nacos_playload.body().value(), e.what());
+        }
+      }
+    }
   }
+  return Http::FilterDataStatus::Continue;
+}
+
+// For responses end-of-stream is indicated by the presence of the END_STREAM flag on the last received HEADERS frame that carries Trailers.
+// 从抓包来看 grpc 的回应包，在 DATA frame 之后都会有个 HEADERS frame，其中有会设置 END_STREAM，同时带上trailer header
+Http::FilterTrailersStatus Filter::encodeTrailers(Http::HeaderMap& trailers) {
+    ENVOY_LOG(info, "nacos2 response trailers \n {}", trailers);
+    return Http::FilterTrailersStatus::Continue;
+}
+
+Http::FilterMetadataStatus Filter::encodeMetadata(Http::MetadataMap& metadata) {
+    ENVOY_LOG(info, "nacos2 response metadata \n {}", metadata);
+    return Http::FilterMetadataStatus::Continue;
 }
 
 } // namespace GrpcHttp1ReverseBridge
