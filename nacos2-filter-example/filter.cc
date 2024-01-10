@@ -6,7 +6,9 @@
 #include "common/grpc/status.h"
 #include "common/http/headers.h"
 #include "common/http/utility.h"
-#include "common/json/json_loader.h"
+#include <rapidjson/document.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
 #include "extensions/filters/http/well_known_names.h"
 
 namespace Envoy {
@@ -68,13 +70,14 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::HeaderMap& headers, bool e
   //  - mark this request as being gRPC
   //  - change the content-type to application/x-protobuf
   if (Envoy::Grpc::Common::hasGrpcContentType(headers)) {
-    enabled_ = true;
+    nacos2_enabled_ = true;
   }
   return Http::FilterHeadersStatus::Continue;
 }
 
 Http::FilterDataStatus Filter::decodeData(Buffer::Instance& buffer, bool end_stream) {
-  if (enabled_) {
+  ENVOY_LOG(info, "nacos request complete end_stream: {}", end_stream);
+  if (nacos2_enabled_) {
     // Fail the request if the body is too small to possibly contain a gRPC frame.
     if (buffer.length() < Grpc::GRPC_FRAME_HEADER_SIZE) {
       decoder_callbacks_->sendLocalReply(Http::Code::OK, "invalid request body", nullptr,
@@ -89,11 +92,14 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& buffer, bool end_str
       com::alibaba::nacos::api::grpc::Payload nacos_playload;
       onDecodeComplete(buffer, &nacos_playload);
     }
+  } else {
+    ENVOY_LOG(info, "nacos1 request complete {}", buffer.toString());
   }
   return Http::FilterDataStatus::Continue;
 }
 
-Http::FilterTrailersStatus Filter::decodeTrailers(Http::HeaderMap&) {
+Http::FilterTrailersStatus Filter::decodeTrailers(Http::HeaderMap& trailers) {
+    ENVOY_LOG(info, "nacos request trailers {}", trailers);
     return Http::FilterTrailersStatus::Continue;
 }
 
@@ -167,9 +173,9 @@ bool Filter::onDecodeComplete(Buffer::Instance& data, com::alibaba::nacos::api::
    first on a stream reprioritize the stream (Section 5.3.3).
 */
 Http::FilterHeadersStatus Filter::encodeHeaders(Http::HeaderMap& headers, bool end_stream) {
-  ENVOY_LOG(info, "nacos2 response headers complete (end_stream={}): \n{}", end_stream, headers);
+  ENVOY_LOG(info, "nacos response headers complete (end_stream={}): \n{}", end_stream, headers);
   if (Envoy::Grpc::Common::hasGrpcContentType(headers)) {
-    enabled_ = true;
+    nacos2_enabled_ = true;
   }
 
   return Http::FilterHeadersStatus::Continue;
@@ -210,7 +216,7 @@ The DATA frame defines the following flags:
 Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_stream) {
   // 在 response 的 DATA frame 里面 end_stream 就没为空过
   ENVOY_LOG(info, "nacos2 response end_stream: {} filter", end_stream);
-  if (enabled_) {
+  if (nacos2_enabled_) {
     // Fail the request if the body is too small to possibly contain a gRPC frame.
     if (buffer.length() < Grpc::GRPC_FRAME_HEADER_SIZE) {
       decoder_callbacks_->sendLocalReply(Http::Code::OK, "invalid response body", nullptr,
@@ -223,19 +229,49 @@ Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_str
       // 如果是服务发现相关的请求
       ::com::alibaba::nacos::api::grpc::Metadata nacos_metadata = nacos_playload.metadata();
       if ( nacos_metadata.type() == "SubscribeServiceResponse" || nacos_metadata.type() == "NotifySubscriberRequest") {
-        try {
-          Json::ObjectSharedPtr json_body = Json::Factory::loadFromString(nacos_playload.body().value());
-          Json::ObjectSharedPtr serviceinfo_json =  json_body->getObject("serviceInfo", false);
-          std::vector<Json::ObjectSharedPtr> hosts_json =  serviceinfo_json->getObjectArray("hosts", false);
-          for(const auto& host : hosts_json) {
-            ENVOY_LOG(info, "nacos2 return host ip {}", host->getString("ip"));
+          rapidjson::Document document;
+          rapidjson::ParseResult ok = document.Parse(nacos_playload.body().value().c_str());
+          if (!ok) {
+            ENVOY_LOG(error, "nacos2 json body {} parse fail", nacos_playload.body().value());
           }
-        } catch (const Json::Exception& e) {
-          // Body parsing failed.
-          ENVOY_LOG(error, "nacos2 json body {} parse fail {}", nacos_playload.body().value(), e.what());
-        }
+          rapidjson::Value& hosts =  document["serviceInfo"]["hosts"];
+          for (rapidjson::SizeType i = 0; i < hosts.Size(); i++) {
+            ENVOY_LOG(info, "nacos2 return host ip {}", hosts[i]["ip"].GetString());
+            // 替换 ip 字段为服务名
+            std::string service_name = document["serviceInfo"]["name"].GetString();
+            rapidjson::Value& host_ip = hosts[i]["ip"];
+            host_ip.SetString(service_name.c_str(), service_name.size());
+          }
+          rapidjson::StringBuffer json_buffer;
+          rapidjson::Writer<rapidjson::StringBuffer> writer(json_buffer);
+          document.Accept(writer);
+          ENVOY_LOG(info, "nacos2 {} replace host ip res {}", nacos_metadata.type(), json_buffer.GetString());
+
+          // 构造新的 pb 作为 response 的 playload
+          nacos_playload.mutable_body()->set_value(std::string(json_buffer.GetString()));
+          ENVOY_LOG(info, "nacos2 replace host ip new_palyload {}", nacos_playload.DebugString());
+
+          std::string new_playload;
+          nacos_playload.SerializeToString(&new_playload);
+
+          Buffer::OwnedImpl new_buffer{};
+          new_buffer.prepend(new_playload);
+          const auto length = nacos_playload.ByteSize();
+          std::array<uint8_t, Grpc::GRPC_FRAME_HEADER_SIZE> frame;
+          Grpc::Encoder().newFrame(Grpc::GRPC_FH_DEFAULT, length, frame);
+          Buffer::OwnedImpl frame_buffer(frame.data(), frame.size());
+          new_buffer.prepend(frame_buffer);
+          ENVOY_LOG(info, "nacos2 response DATA frame length {}, new_buffer lenght {}\n", buffer.length(), new_buffer.length());
+          // 这样写，buffer 好像没改变？
+          // buffer = new_buffer;
+
+          // 试试这样
+          buffer.drain(buffer.length());
+          buffer.move(new_buffer);
       }
     }
+  } else {
+    ENVOY_LOG(info, "nacos1 response complete {}", buffer.toString());
   }
   return Http::FilterDataStatus::Continue;
 }
@@ -243,12 +279,12 @@ Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_str
 // For responses end-of-stream is indicated by the presence of the END_STREAM flag on the last received HEADERS frame that carries Trailers.
 // 从抓包来看 grpc 的回应包，在 DATA frame 之后都会有个 HEADERS frame，其中有会设置 END_STREAM，同时带上trailer header
 Http::FilterTrailersStatus Filter::encodeTrailers(Http::HeaderMap& trailers) {
-    ENVOY_LOG(info, "nacos2 response trailers \n {}", trailers);
+    ENVOY_LOG(info, "nacos response trailers \n {}", trailers);
     return Http::FilterTrailersStatus::Continue;
 }
 
 Http::FilterMetadataStatus Filter::encodeMetadata(Http::MetadataMap& metadata) {
-    ENVOY_LOG(info, "nacos2 response metadata \n {}", metadata);
+    ENVOY_LOG(info, "nacos response metadata \n {}", metadata);
     return Http::FilterMetadataStatus::Continue;
 }
 

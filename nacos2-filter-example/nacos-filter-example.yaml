@@ -7,7 +7,7 @@ admin:
 
 static_resources:
   clusters:
-    name: nacos
+  - name: nacos
     connect_timeout: 0.25s
     load_assignment:
       cluster_name: nacos
@@ -18,7 +18,7 @@ static_resources:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 8848
-    name: nacos_2
+  - name: nacos_2
     connect_timeout: 0.25s
     http2_protocol_options: {}
     load_assignment:
@@ -32,7 +32,8 @@ static_resources:
                     port_value: 9848
 
   listeners:
-    name: listener_0
+  # 下面不加这一个 ‘-’ 会导致 envoy 只加载最后面一个 name
+  - name: listener_nacos1
     address:
       socket_address:
         address: 0.0.0.0
@@ -42,10 +43,10 @@ static_resources:
       - name: envoy.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
-          stat_prefix: ingress_http
+          stat_prefix: nacos1
           codec_type: AUTO
           route_config:
-            name: local_route
+            name: local_route_nacos1
             virtual_hosts:
             - name: local_service
               domains: ["*"]
@@ -53,12 +54,9 @@ static_resources:
               - match: { prefix: "/nacos" }
                 route: { cluster: nacos }
           http_filters:
-          - name: sample          # before envoy.router because order matters!
-            config:
-              key: via
-              val: sample-filter
+          - name: nacos2_example          # before envoy.router because order matters! 
           - name: envoy.router
-    name: listener_nacos2
+  - name: listener_nacos2
     address:
       socket_address:
         address: 0.0.0.0
@@ -68,10 +66,10 @@ static_resources:
       - name: envoy.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
-          stat_prefix: ingress_http
+          stat_prefix: nacos2
           codec_type: AUTO
           route_config:
-            name: local_route
+            name: local_route_nacos2
             virtual_hosts:
             - name: local_service
               domains:
