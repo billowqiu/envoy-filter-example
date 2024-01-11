@@ -58,8 +58,14 @@ Filter::~Filter() {
 }
 
 Http::FilterHeadersStatus Filter::decodeHeaders(Http::HeaderMap& headers, bool end_stream) {
-  ENVOY_LOG(info, "nacos2 request headers complete (end_stream={}): {} filter", end_stream, headers);
+  ENVOY_LOG(info, "nacos request headers complete (end_stream={}): {} filter", end_stream, headers);
+  if ( absl::StartsWith(headers.Path()->value().getStringView(), "/nacos/v1/ns/instance/list") 
+    && headers.Method()->value().getStringView() == "GET") {
+    ENVOY_LOG(info, "this is nacos1 list request");
+    nacos1_list_req_ = true;
+  }
   // Short circuit if header only.
+  // nacos1 很多请求就是没有 body！！！
   if (end_stream) {
     return Http::FilterHeadersStatus::Continue;
   }
@@ -272,6 +278,32 @@ Http::FilterDataStatus Filter::encodeData(Buffer::Instance& buffer, bool end_str
     }
   } else {
     ENVOY_LOG(info, "nacos1 response complete {}", buffer.toString());
+    if (nacos1_list_req_) {
+      rapidjson::Document document;
+      rapidjson::ParseResult ok = document.Parse(buffer.toString().c_str());
+      if (!ok) {
+        ENVOY_LOG(error, "nacos json body {} parse fail", buffer.toString());
+      }
+      rapidjson::Value& hosts =  document["hosts"];
+      for (rapidjson::SizeType i = 0; i < hosts.Size(); i++) {
+        ENVOY_LOG(info, "nacos return host ip {}", hosts[i]["ip"].GetString());
+        // 从最后一个@开始取字串
+        rapidjson::Value& host_ip = hosts[i]["ip"];
+        // 替换 ip 字段为服务名
+        std::string service_name = hosts[i]["serviceName"].GetString();
+        auto const pos = service_name.find_last_of('@');
+        service_name = service_name.substr(pos+1);
+        host_ip.SetString(service_name.c_str(), service_name.size());
+      }
+      rapidjson::StringBuffer json_buffer;
+      rapidjson::Writer<rapidjson::StringBuffer> writer(json_buffer);
+      document.Accept(writer);
+      ENVOY_LOG(info, "nacos1 replace host ip res {}", json_buffer.GetString());
+      ENVOY_LOG(info, "nacos1 response DATA frame length {}, new_buffer lenght {}\n", buffer.length(), json_buffer.GetSize());
+      buffer.drain(buffer.length());
+      buffer.add(json_buffer.GetString());
+    }
+
   }
   return Http::FilterDataStatus::Continue;
 }

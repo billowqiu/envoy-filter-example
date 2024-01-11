@@ -32,6 +32,7 @@ private:
   bool onDecodeComplete(Buffer::Instance& data, com::alibaba::nacos::api::grpc::Payload* playload);
 private:
   bool nacos2_enabled_{};
+  bool nacos1_list_req_{};
   Grpc::Context& context_;
 };
 } // namespace Nacos2FilterExample
